@@ -1,84 +1,90 @@
+import os
+import numpy as np
 import pandas as pd
 import torch
-from torch.nn.functional import sigmoid
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import BertTokenizerFast, BertForSequenceClassification
+import PyPDF2
+import docx
+ 
+def load_text_from_file(filepath):
+    ext = filepath.lower().split(".")[-1]
 
-# STEP 1: Load pretrained model
-class LoadPretrained:
-    def __init__(self, model_path="./clinicalbert_icd_multilabel", label_map_path="icd_label_map.csv"):
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        label_map = pd.read_csv(label_map_path)
-        self.label_names = label_map["ICD_Code"].tolist()
-        print(f"Loaded {len(self.label_names)} ICD codes from label map.")
+    if ext == "txt":
+        return open(filepath, "r", encoding="utf-8", errors="ignore").read()
 
+    elif ext == "csv":
+        df = pd.read_csv(filepath)
+        return " ".join(df.astype(str).fillna("").values.flatten())
 
-# STEP 2: Load new summaries
-class LoadSummary:
-    def __init__(self, summary_path="synthetic.csv"):
-        self.df = pd.read_csv(summary_path)
-
+    elif ext == "pdf":
         
-        if "text" not in self.df.columns:
-            raise ValueError("CSV must contain a 'text' column with patient summaries!")
-        print(f"Found {len(self.df)} patient summaries to classify.")
+        text = ""
+        with open(filepath, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() + " "
+        return text
+
+    elif ext == "docx":
+       
+        doc = docx.Document(filepath)
+        return " ".join([p.text for p in doc.paragraphs])
+    
+    else:
+        raise ValueError("Unsupported file format")
 
 
-# STEP 3: Predict ICD codes
-class PredictICDCodes:
-    def __init__(self, model, tokenizer, label_names):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.label_names = label_names
-
-    def predict(self, df, threshold=0.3):
-        self.model.eval()
-        predictions = []
-
-        for i, text in enumerate(df["text"].tolist(), start=1):
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                probs = sigmoid(outputs.logits).squeeze().cpu().numpy()
-
-            results = sorted(zip(self.label_names, probs), key=lambda x: x[1], reverse=True)
-            top_preds = [(icd, round(score, 3)) for icd, score in results if score > threshold]
-            predictions.append([icd for icd, _ in top_preds])
-
-            print(f"\nSummary {i}:")
-            print(f"Text snippet: {text[:250]}...")
-            if top_preds:
-                print("Predicted ICD codes:")
-                for icd, score in top_preds:
-                    print(f" - {icd}: {score}")
-            else:
-                print("No strong ICD match found.")
-
-        return predictions
+def load_tokenizer(model_dir):
+    try:
+        print(f"Loading tokenizer from: {model_dir}")
+        return BertTokenizerFast.from_pretrained(model_dir)
+    except:
+        print("⚠ Tokenizer missing — using Bio_ClinicalBERT tokenizer instead")
+        return BertTokenizerFast.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
 
 
-# STEP 4: Save results
+def predict_codes(model_dir, input_text):
+    # Load tokenizer
+    tokenizer = load_tokenizer(model_dir)
 
-class SaveResults:
-    def __init__(self, df, predictions, output_path="predicted_icd_results.csv"):
-        df["predicted_icd_codes"] = predictions
-        df.to_csv(output_path, index=False)
-        print(f"\nPredictions saved to '{output_path}'")
+    # Load classes
+    classes = np.load(os.path.join(model_dir, "mlb_classes.npy"), allow_pickle=True)
+
+    # Load thresholds
+    thresholds_path = os.path.join(model_dir, "thresholds.npy")
+    thresholds = np.load(thresholds_path) if os.path.exists(thresholds_path) else np.array([0.60] * len(classes))
+
+    # Load model
+    model = BertForSequenceClassification.from_pretrained(model_dir)
+    model.eval()
+
+    # Tokenize
+    enc = tokenizer(input_text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+
+    with torch.no_grad():
+        logits = model(**enc).logits
+
+    probs = torch.sigmoid(logits).numpy()[0]
+    pred_idx = np.where(probs >= thresholds)[0]
+    predicted_codes = [classes[i] for i in pred_idx]
+
+    return predicted_codes, probs
 
 
+def run_predictions(input_file):
+    text = load_text_from_file(input_file)
 
-# PIPELINE EXECUTION
+    print("\n================ ICD MODEL ================")
+    icd_pred, _ = predict_codes("ICD_MODEL", text)
+    print("ICD PRED:", icd_pred)
+
+    print("\n================ CPT MODEL ================")
+    cpt_pred, _ = predict_codes("CPT_MODEL", text)
+    print("CPT PRED:", cpt_pred)
+
+    return icd_pred, cpt_pred
+
 
 if __name__ == "__main__":
-    # Step 1: Load model
-    loader = LoadPretrained()
-
-    # Step 2: Load summaries
-    summaries = LoadSummary()
-
-    # Step 3: Predict ICD codes
-    predictor = PredictICDCodes(loader.model, loader.tokenizer, loader.label_names)
-    preds = predictor.predict(summaries.df)
-
-    # Step 4: Save results
-    SaveResults(summaries.df, preds)
+    FILE = "CASE – 8689439.txt"   # change this filename to test other files
+    run_predictions(FILE)
